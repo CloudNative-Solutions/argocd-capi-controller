@@ -11,4 +11,4 @@ kind: Kustomization
 images:
 - name: controller
   newName: "ghcr.io/cloudnative-solutions/argocd-capi-controller"
-  newTag: v0.1.0
+  newTag: v0.2.0
