@@ -1,8 +1,12 @@
-# capi-argo
-// TODO(user): Add simple overview of use/purpose
+# argo-capi
+Controller for ArgoCD to automatically add clusters created by CAPI
 
 ## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+This controller makes a few assumptions right now
+
+- CAPI is installed in the cluster this is being deployed to
+- ArgoCD is installed in the cluster this is being deploy to
+- ArgoCD is installed in the `argocd` namespace
 
 ## Getting Started
 
@@ -16,7 +20,7 @@
 **Build and push your image to the location specified by `IMG`:**
 
 ```sh
-make docker-build docker-push IMG=<some-registry>/capi-argo:tag
+make docker-build docker-push IMG=<some-registry>/argo-capi:tag
 ```
 
 **NOTE:** This image ought to be published in the personal registry you specified. 
@@ -32,7 +36,7 @@ make install
 **Deploy the Manager to the cluster with the image specified by `IMG`:**
 
 ```sh
-make deploy IMG=<some-registry>/capi-argo:tag
+make deploy IMG=<some-registry>/argo-capi:tag
 ```
 
 > **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin 

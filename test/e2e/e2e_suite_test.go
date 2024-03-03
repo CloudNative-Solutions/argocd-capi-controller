@@ -27,6 +27,6 @@ import (
 // Run e2e tests using the Ginkgo runner.
 func TestE2E(t *testing.T) {
 	RegisterFailHandler(Fail)
-	fmt.Fprintf(GinkgoWriter, "Starting capi-argo suite\n")
+	fmt.Fprintf(GinkgoWriter, "Starting argo-capi suite\n")
 	RunSpecs(t, "e2e suite")
 }

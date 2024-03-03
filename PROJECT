@@ -8,7 +8,7 @@ layout:
 plugins:
   manifests.sdk.operatorframework.io/v2: {}
   scorecard.sdk.operatorframework.io/v2: {}
-projectName: capi-argo
+projectName: argo-capi
 repo: github.com/CloudNative-Solutions/argocd-capi-controller
 resources:
 - controller: true
