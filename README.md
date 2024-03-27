@@ -1,4 +1,4 @@
-# argo-capi
+# argo-capi-controller
 Controller for ArgoCD to automatically add clusters created by CAPI
 
 ## Description
@@ -12,15 +12,15 @@ This controller makes a few assumptions right now
 
 ### Prerequisites
 - go version v1.20.0+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
+- docker version 18+.
+- kubectl version v1.25+.
+- Access to a Kubernetes v1.25+ cluster.
 
 ### To Deploy on the cluster
 **Build and push your image to the location specified by `IMG`:**
 
 ```sh
-make docker-build docker-push IMG=<some-registry>/argo-capi:tag
+make docker-build docker-push IMG=<some-registry>/argo-capi-controller:tag
 ```
 
 **NOTE:** This image ought to be published in the personal registry you specified. 
@@ -36,7 +36,7 @@ make install
 **Deploy the Manager to the cluster with the image specified by `IMG`:**
 
 ```sh
-make deploy IMG=<some-registry>/argo-capi:tag
+make deploy IMG=<some-registry>/argo-capi-controller:tag
 ```
 
 > **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin 
@@ -71,7 +71,7 @@ make undeploy
 ```
 
 ## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
+// TODO: Add detailed information on how you would like others to contribute to this project
 
 **NOTE:** Run `make help` for more information on all potential `make` targets
 
