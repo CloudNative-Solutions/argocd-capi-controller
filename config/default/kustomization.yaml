@@ -27,10 +27,14 @@ resources:
 #- ../prometheus
 
 patches:
-# Protect the /metrics endpoint by putting it behind auth.
-# If you want your controller-manager to expose the /metrics
-# endpoint w/o any authn/z, please comment the following line.
-- path: manager_auth_proxy_patch.yaml
+# kube-rbac-proxy sidecar removed: gcr.io/kubebuilder/kube-rbac-proxy was
+# deprecated by Google and there is no kubernetes-sigs replacement. The
+# project's only canonical upstream (quay.io/brancz/kube-rbac-proxy) is
+# maintained by an individual outside SIG-Auth, so we drop the sidecar
+# entirely — it's the modern kubebuilder pattern. Metrics are not exposed.
+# Re-enable manager_auth_proxy_patch.yaml only if you need scrapeable
+# /metrics with token-review auth.
+#- path: manager_auth_proxy_patch.yaml
 
 # [WEBHOOK] To enable webhook, uncomment all the sections with [WEBHOOK] prefix including the one in
 # crd/kustomization.yaml
