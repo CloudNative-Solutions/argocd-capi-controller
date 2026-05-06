@@ -15,7 +15,10 @@ spec:
           capabilities:
             drop:
             - "ALL"
-        image: gcr.io/kubebuilder/kube-rbac-proxy:v0.15.0
+        # Upstream: github.com/brancz/kube-rbac-proxy. The legacy
+        # gcr.io/kubebuilder/kube-rbac-proxy mirror was deprecated and
+        # removed by Google; pull directly from the maintainer's registry.
+        image: quay.io/brancz/kube-rbac-proxy:v0.19.0
         args:
         - "--secure-listen-address=0.0.0.0:8443"
         - "--upstream=http://127.0.0.1:8080/"
