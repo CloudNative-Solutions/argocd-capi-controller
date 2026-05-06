@@ -28,8 +28,14 @@ import (
 	capi "sigs.k8s.io/cluster-api/api/v1beta1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
+
+// argoCAPIFinalizer guards the ArgoCD cluster Secret so we can clean it up
+// when the upstream CAPI Cluster CR is deleted. Without this, deleted CAPI
+// Clusters leave orphan "unavailable" entries lingering in ArgoCD.
+const argoCAPIFinalizer = "argo-capi.cloudnativesolutions.ro/finalizer"
 
 // ClusterReconciler reconciles a Cluster object
 type ClusterReconciler struct {
@@ -43,36 +49,72 @@ type ClusterReconciler struct {
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.16.3/pkg/reconcile
 func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	_ = log.FromContext(ctx)
-
-	log := log.Log.WithValues("cluster", req.NamespacedName)
+	log := log.FromContext(ctx).WithValues("cluster", req.NamespacedName)
 
 	// retrieve the cluster object
 	var cluster capi.Cluster
 	if err := r.Get(ctx, req.NamespacedName, &cluster); err != nil {
+		if errors.IsNotFound(err) {
+			// Cluster has already been removed; nothing to do.
+			return ctrl.Result{}, nil
+		}
 		log.Error(err, "unable to fetch cluster")
 		return ctrl.Result{}, err
 	}
 
-	// if control plane is not ready, return and requeue
-	if !cluster.Status.ControlPlaneReady {
-		log.Info(fmt.Sprintf("cluster %s is not ready", cluster.Name))
-		return ctrl.Result{Requeue: true}, nil
-	}
-
-	// check status of cluster controlplane
-	// if controlplane is ready let's do some stuff
-	log.Info(fmt.Sprintf("cluster %s is ready", cluster.Name))
-
-	// create connection to management cluster
-	clientset, err := GetMgmtClusterConfig()
+	// Connect to the management cluster (where the ArgoCD cluster Secret lives).
+	mgmtClient, err := GetMgmtClusterConfig()
 	if err != nil {
 		log.Error(err, "unable to create client for management cluster")
 		return ctrl.Result{}, err
 	}
 
+	secretName := fmt.Sprintf("cluster-%s", cluster.Name)
+
+	// ── Deletion path ────────────────────────────────────────────────────
+	// When the CAPI Cluster is being deleted, drop the ArgoCD cluster Secret
+	// before letting the finalizer go so the workload cluster doesn't linger
+	// in ArgoCD as "Unknown/Unavailable".
+	if !cluster.DeletionTimestamp.IsZero() {
+		if controllerutil.ContainsFinalizer(&cluster, argoCAPIFinalizer) {
+			log.Info("cluster is being deleted; removing ArgoCD cluster secret", "secret", secretName)
+			err := mgmtClient.CoreV1().Secrets("argocd").Delete(ctx, secretName, v1.DeleteOptions{})
+			if err != nil && !errors.IsNotFound(err) {
+				log.Error(err, "unable to delete ArgoCD cluster secret")
+				return ctrl.Result{}, err
+			}
+			controllerutil.RemoveFinalizer(&cluster, argoCAPIFinalizer)
+			if err := r.Update(ctx, &cluster); err != nil {
+				log.Error(err, "unable to remove finalizer")
+				return ctrl.Result{}, err
+			}
+		}
+		return ctrl.Result{}, nil
+	}
+
+	// ── Ensure finalizer is in place ─────────────────────────────────────
+	// Set on first reconcile so the deletion path above will run.
+	if !controllerutil.ContainsFinalizer(&cluster, argoCAPIFinalizer) {
+		controllerutil.AddFinalizer(&cluster, argoCAPIFinalizer)
+		if err := r.Update(ctx, &cluster); err != nil {
+			log.Error(err, "unable to set finalizer")
+			return ctrl.Result{}, err
+		}
+		// Re-queue with the freshly persisted object so the rest of the
+		// reconcile sees the updated metadata.
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	// if control plane is not ready, return and requeue
+	if !cluster.Status.ControlPlaneReady {
+		log.Info(fmt.Sprintf("cluster %s controlplane is not ready", cluster.Name))
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	log.Info(fmt.Sprintf("cluster %s controlplane is ready", cluster.Name))
+
 	// create connection to target cluster
-	targetClientset, targetConf, err := GetTargetClusterConfig(clientset, cluster.Namespace, cluster.Name)
+	targetClientset, targetConf, err := GetTargetClusterConfig(mgmtClient, cluster.Namespace, cluster.Name)
 	if err != nil {
 		log.Error(err, "unable to create client config for target cluster")
 		return ctrl.Result{}, err
@@ -99,7 +141,7 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{Requeue: true}, err
 	}
 
-	// create clusterrolebinding in target cluster
+	// create clusterrole in target cluster
 	if _, err := CreateOrUpdateClusterRole(ctx, targetClientset); err != nil {
 		log.Error(err, "unable to create or update clusterrole")
 		return ctrl.Result{Requeue: true}, err
@@ -111,10 +153,9 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{Requeue: true}, err
 	}
 
-	// we need a `config` key that follows this structure:
-	// 		https://argo-cd.readthedocs.io/en/stable/operator-manual/declarative-setup/#clusters
-
-	// create config structure for argocd
+	// Build the ArgoCD cluster config struct (matches ArgoCD's declarative
+	// cluster setup format). See:
+	// https://argo-cd.readthedocs.io/en/stable/operator-manual/declarative-setup/#clusters
 	clusterConfig := ClusterConfig{
 		BearerToken: string(token),
 		TLSClientConfig: TLSClientConfig{
@@ -122,30 +163,27 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			CAData:   targetConf.TLSClientConfig.CAData,
 		},
 	}
-	// marshall config to json
 	data, err := json.Marshal(clusterConfig)
 	if err != nil {
-		log.Error(err, "unable to marshall cluster config")
+		log.Error(err, "unable to marshal cluster config")
 		return ctrl.Result{}, err
 	}
 
-	// pass cluster labels/annotations to secret
-	// this provides metadata for our applicationsets
-	// in argocd
-	labels := make(map[string]string)
-	// add argocd type label so cluster can be found
-	labels["argocd.argoproj.io/secret-type"] = "cluster"
-	// add labels from cluster if any exist
+	// Propagate labels/annotations from the CAPI Cluster onto the ArgoCD
+	// Secret so cluster-generator ApplicationSets can match by selector.
+	labels := map[string]string{
+		"argocd.argoproj.io/secret-type": "cluster",
+	}
 	for k, v := range cluster.GetLabels() {
 		labels[k] = v
 	}
-	// remove argocd.argoproj.io/instance to not show in ArgoCD cluster application.
+	// Strip ArgoCD's app-of-apps tracking marker so the registered cluster
+	// doesn't show up as a managed resource of the parent Application.
 	delete(labels, "argocd.argoproj.io/instance")
 
-	// desired secret for argocd cluster
-	clusterSecret := &corev1.Secret{
+	desired := &corev1.Secret{
 		ObjectMeta: v1.ObjectMeta{
-			Name:      fmt.Sprintf("cluster-%s", cluster.Name),
+			Name:      secretName,
 			Namespace: "argocd",
 			Labels:    labels,
 		},
@@ -157,24 +195,25 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		},
 	}
 
-	// create cluster secret
-	log.Info("cluster", "servername", cluster.Name, "host", targetConf.Host)
-	_, err = clientset.CoreV1().Secrets("argocd").Get(ctx, fmt.Sprintf("cluster-%s", cluster.Name), v1.GetOptions{})
-	if err != nil {
-		if errors.IsNotFound(err) {
-			_, err = clientset.CoreV1().Secrets("argocd").Create(ctx, clusterSecret, v1.CreateOptions{})
-			if err != nil {
-				log.Error(err, "unable to create argocd secret")
-				return ctrl.Result{}, err
-			}
-		}
-		return ctrl.Result{Requeue: true}, err
+	log.Info("reconciling ArgoCD cluster secret", "name", cluster.Name, "host", targetConf.Host)
+	existing, err := mgmtClient.CoreV1().Secrets("argocd").Get(ctx, secretName, v1.GetOptions{})
+	if err != nil && !errors.IsNotFound(err) {
+		log.Error(err, "unable to read existing ArgoCD cluster secret")
+		return ctrl.Result{}, err
 	}
 
-	// if secret does note exist, update it with the above data no matter
-	// what information is currently in the secret.
-	if _, err := clientset.CoreV1().Secrets("argocd").Update(ctx, clusterSecret, v1.UpdateOptions{}); err != nil {
-		log.Error(err, "unable to update argocd secret")
+	if errors.IsNotFound(err) {
+		if _, err := mgmtClient.CoreV1().Secrets("argocd").Create(ctx, desired, v1.CreateOptions{}); err != nil {
+			log.Error(err, "unable to create ArgoCD cluster secret")
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	}
+
+	// Preserve resourceVersion for the update.
+	desired.ResourceVersion = existing.ResourceVersion
+	if _, err := mgmtClient.CoreV1().Secrets("argocd").Update(ctx, desired, v1.UpdateOptions{}); err != nil {
+		log.Error(err, "unable to update ArgoCD cluster secret")
 		return ctrl.Result{}, err
 	}
 
