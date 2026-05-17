@@ -11,15 +11,7 @@ rules:
   verbs:
   - get
   - list
-  - patch
-  - update
   - watch
-- apiGroups:
-  - cluster.x-k8s.io
-  resources:
-  - clusters/finalizers
-  verbs:
-  - update
 - apiGroups:
   - cluster.x-k8s.io
   resources:

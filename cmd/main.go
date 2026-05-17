@@ -30,6 +30,7 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	capi "sigs.k8s.io/cluster-api/api/v1beta1"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -139,8 +140,25 @@ func main() {
 		os.Exit(1)
 	}
 
+	ctx := ctrl.SetupSignalHandler()
+
+	// One-shot startup scan to garbage-collect ArgoCD cluster Secrets whose
+	// CAPI Cluster CR no longer exists. This closes the gap that the
+	// event-driven cleanup in Reconcile can't cover when the controller was
+	// down at the moment a Cluster was deleted. Uses a direct (uncached)
+	// client because the manager's cache isn't running yet.
+	directClient, err := client.New(ctrl.GetConfigOrDie(), client.Options{Scheme: scheme})
+	if err != nil {
+		setupLog.Error(err, "unable to build direct client for orphan scan")
+		os.Exit(1)
+	}
+	if err := controller.ReconcileOrphanSecrets(ctx, directClient); err != nil {
+		// Don't exit — the manager can still run and handle future events.
+		setupLog.Error(err, "orphan-secret scan failed; continuing")
+	}
+
 	setupLog.Info("starting manager")
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+	if err := mgr.Start(ctx); err != nil {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}

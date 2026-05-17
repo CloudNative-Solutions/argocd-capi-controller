@@ -25,17 +25,26 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes"
 	capi "sigs.k8s.io/cluster-api/api/v1beta1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
-// argoCAPIFinalizer guards the ArgoCD cluster Secret so we can clean it up
-// when the upstream CAPI Cluster CR is deleted. Without this, deleted CAPI
-// Clusters leave orphan "unavailable" entries lingering in ArgoCD.
-const argoCAPIFinalizer = "argo-capi.cloudnativesolutions.ro/finalizer"
+// Labels we set on the ArgoCD cluster Secret. The cluster-name label lets us
+// reverse-map a Secret back to its source CAPI Cluster during the startup
+// orphan scan without parsing the Secret name.
+const (
+	argoCDClusterSecretType  = "argocd.argoproj.io/secret-type"
+	argoCDClusterSecretValue = "cluster"
+	capiClusterNameLabel     = "cluster.x-k8s.io/cluster-name"
+)
+
+// secretNameForCluster mirrors ArgoCD's `cluster-<name>` convention.
+func secretNameForCluster(name string) string {
+	return fmt.Sprintf("cluster-%s", name)
+}
 
 // ClusterReconciler reconciles a Cluster object
 type ClusterReconciler struct {
@@ -51,58 +60,25 @@ type ClusterReconciler struct {
 func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := log.FromContext(ctx).WithValues("cluster", req.NamespacedName)
 
-	// retrieve the cluster object
-	var cluster capi.Cluster
-	if err := r.Get(ctx, req.NamespacedName, &cluster); err != nil {
-		if errors.IsNotFound(err) {
-			// Cluster has already been removed; nothing to do.
-			return ctrl.Result{}, nil
-		}
-		log.Error(err, "unable to fetch cluster")
-		return ctrl.Result{}, err
-	}
-
-	// Connect to the management cluster (where the ArgoCD cluster Secret lives).
 	mgmtClient, err := GetMgmtClusterConfig()
 	if err != nil {
 		log.Error(err, "unable to create client for management cluster")
 		return ctrl.Result{}, err
 	}
 
-	secretName := fmt.Sprintf("cluster-%s", cluster.Name)
-
-	// ── Deletion path ────────────────────────────────────────────────────
-	// When the CAPI Cluster is being deleted, drop the ArgoCD cluster Secret
-	// before letting the finalizer go so the workload cluster doesn't linger
-	// in ArgoCD as "Unknown/Unavailable".
-	if !cluster.DeletionTimestamp.IsZero() {
-		if controllerutil.ContainsFinalizer(&cluster, argoCAPIFinalizer) {
-			log.Info("cluster is being deleted; removing ArgoCD cluster secret", "secret", secretName)
-			err := mgmtClient.CoreV1().Secrets("argocd").Delete(ctx, secretName, v1.DeleteOptions{})
-			if err != nil && !errors.IsNotFound(err) {
-				log.Error(err, "unable to delete ArgoCD cluster secret")
-				return ctrl.Result{}, err
-			}
-			controllerutil.RemoveFinalizer(&cluster, argoCAPIFinalizer)
-			if err := r.Update(ctx, &cluster); err != nil {
-				log.Error(err, "unable to remove finalizer")
-				return ctrl.Result{}, err
-			}
+	// ── Cluster CR may already be gone ───────────────────────────────────
+	// When a CAPI Cluster is deleted the informer still delivers a final
+	// reconcile for its key — the Get below returns NotFound. We use that
+	// as our cleanup trigger instead of a finalizer; the watch is reliable
+	// while the controller is running, and the startup orphan scan in
+	// ReconcileOrphanSecrets covers the down-during-delete case.
+	var cluster capi.Cluster
+	if err := r.Get(ctx, req.NamespacedName, &cluster); err != nil {
+		if errors.IsNotFound(err) {
+			return ctrl.Result{}, deleteArgoCDClusterSecret(ctx, mgmtClient, req.Name)
 		}
-		return ctrl.Result{}, nil
-	}
-
-	// ── Ensure finalizer is in place ─────────────────────────────────────
-	// Set on first reconcile so the deletion path above will run.
-	if !controllerutil.ContainsFinalizer(&cluster, argoCAPIFinalizer) {
-		controllerutil.AddFinalizer(&cluster, argoCAPIFinalizer)
-		if err := r.Update(ctx, &cluster); err != nil {
-			log.Error(err, "unable to set finalizer")
-			return ctrl.Result{}, err
-		}
-		// Re-queue with the freshly persisted object so the rest of the
-		// reconcile sees the updated metadata.
-		return ctrl.Result{Requeue: true}, nil
+		log.Error(err, "unable to fetch cluster")
+		return ctrl.Result{}, err
 	}
 
 	// if control plane is not ready, return and requeue
@@ -171,8 +147,11 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	// Propagate labels/annotations from the CAPI Cluster onto the ArgoCD
 	// Secret so cluster-generator ApplicationSets can match by selector.
+	// `cluster.x-k8s.io/cluster-name` is set unconditionally so the startup
+	// orphan scan can reverse-map Secret → Cluster without parsing names.
 	labels := map[string]string{
-		"argocd.argoproj.io/secret-type": "cluster",
+		argoCDClusterSecretType: argoCDClusterSecretValue,
+		capiClusterNameLabel:    cluster.Name,
 	}
 	for k, v := range cluster.GetLabels() {
 		labels[k] = v
@@ -181,6 +160,7 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// doesn't show up as a managed resource of the parent Application.
 	delete(labels, "argocd.argoproj.io/instance")
 
+	secretName := secretNameForCluster(cluster.Name)
 	desired := &corev1.Secret{
 		ObjectMeta: v1.ObjectMeta{
 			Name:      secretName,
@@ -218,6 +198,75 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// deleteArgoCDClusterSecret removes the `cluster-<name>` Secret from the
+// argocd namespace if present. Used by both the event-driven cleanup path
+// (Reconcile-NotFound) and the startup orphan scan.
+func deleteArgoCDClusterSecret(ctx context.Context, mgmtClient kubernetes.Interface, clusterName string) error {
+	log := log.FromContext(ctx)
+	secretName := secretNameForCluster(clusterName)
+	if err := mgmtClient.CoreV1().Secrets("argocd").Delete(ctx, secretName, v1.DeleteOptions{}); err != nil {
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		log.Error(err, "unable to delete ArgoCD cluster secret", "secret", secretName)
+		return err
+	}
+	log.Info("deleted ArgoCD cluster secret", "secret", secretName)
+	return nil
+}
+
+// ReconcileOrphanSecrets runs once at controller startup to garbage-collect
+// ArgoCD cluster Secrets whose backing CAPI Cluster CR no longer exists.
+// This closes the "controller was down during delete" gap that an
+// event-driven cleanup alone can't cover, without us having to put a
+// finalizer on a CR we don't own.
+//
+// Pass a direct (uncached) client — the manager's cache isn't populated yet
+// when this is called.
+func ReconcileOrphanSecrets(ctx context.Context, capiClient client.Client) error {
+	log := log.FromContext(ctx).WithName("orphan-scan")
+
+	mgmtClient, err := GetMgmtClusterConfig()
+	if err != nil {
+		return fmt.Errorf("management client: %w", err)
+	}
+
+	secrets, err := mgmtClient.CoreV1().Secrets("argocd").List(ctx, v1.ListOptions{
+		LabelSelector: fmt.Sprintf("%s=%s,%s",
+			argoCDClusterSecretType, argoCDClusterSecretValue, capiClusterNameLabel),
+	})
+	if err != nil {
+		return fmt.Errorf("list argocd cluster secrets: %w", err)
+	}
+
+	var clusters capi.ClusterList
+	if err := capiClient.List(ctx, &clusters); err != nil {
+		return fmt.Errorf("list CAPI clusters: %w", err)
+	}
+	live := make(map[string]struct{}, len(clusters.Items))
+	for _, c := range clusters.Items {
+		live[c.Name] = struct{}{}
+	}
+
+	for i := range secrets.Items {
+		s := &secrets.Items[i]
+		name := s.Labels[capiClusterNameLabel]
+		if name == "" {
+			continue
+		}
+		if _, ok := live[name]; ok {
+			continue
+		}
+		log.Info("garbage-collecting orphan ArgoCD cluster secret",
+			"secret", s.Name, "cluster", name)
+		if err := deleteArgoCDClusterSecret(ctx, mgmtClient, name); err != nil {
+			// Log and continue; one bad orphan shouldn't block the rest.
+			log.Error(err, "failed to delete orphan", "secret", s.Name)
+		}
+	}
+	return nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
