@@ -12,6 +12,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	capi "sigs.k8s.io/cluster-api/api/v1beta1"
 	ctrl "sigs.k8s.io/controller-runtime"
 )
 
@@ -196,4 +197,13 @@ func GetKubeSystemUID(ctx context.Context, clientset kubernetes.Interface) (type
 // this token is used to authenticate with the target cluster along with the CA
 func GetServiceAccountBearerToken(ctx context.Context, clientset *kubernetes.Clientset, svcscrt corev1.Secret) ([]byte, error) {
 	return svcscrt.Data["token"], nil
+}
+
+// IsManagementCluster checks if the cluster is the management cluster
+func IsManagementCluster(cluster capi.Cluster) bool {
+	// Check if the cluster has a label that marks it as the management cluster
+	if val, ok := cluster.Labels["management-cluster"]; ok && val == "true" {
+		return true
+	}
+	return false
 }

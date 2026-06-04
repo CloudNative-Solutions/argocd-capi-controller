@@ -81,6 +81,12 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, err
 	}
 
+	// Skip reconciliation for the management cluster
+	if IsManagementCluster(cluster) {
+		log.Info(fmt.Sprintf("Skipping reconciliation for management cluster %s", cluster.Name))
+		return ctrl.Result{}, nil
+	}
+
 	// if control plane is not ready, return and requeue
 	if !cluster.Status.ControlPlaneReady {
 		log.Info(fmt.Sprintf("cluster %s controlplane is not ready", cluster.Name))
