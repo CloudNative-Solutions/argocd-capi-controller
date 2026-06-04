@@ -96,6 +96,29 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, err
 	}
 
+	// ── Skip the in-cluster ──────────────────────────────────────────────
+	// A self-managing management cluster has its own CAPI Cluster CR, but
+	// ArgoCD already manages it as the built-in "in-cluster"
+	// (https://kubernetes.default.svc). Registering it again via its external
+	// endpoint would create a duplicate that double-matches ApplicationSet
+	// cluster generators. We fingerprint cluster identity by the kube-system
+	// namespace UID — equal UIDs mean the target IS the management cluster.
+	mgmtUID, err := GetKubeSystemUID(ctx, mgmtClient)
+	if err != nil {
+		log.Error(err, "unable to read management cluster kube-system UID")
+		return ctrl.Result{Requeue: true}, err
+	}
+	targetUID, err := GetKubeSystemUID(ctx, targetClientset)
+	if err != nil {
+		log.Error(err, "unable to read target cluster kube-system UID")
+		return ctrl.Result{Requeue: true}, err
+	}
+	if mgmtUID == targetUID {
+		log.Info("cluster is the management/in-cluster; skipping ArgoCD registration", "cluster", cluster.Name)
+		// Remove any secret created before this guard existed (idempotent).
+		return ctrl.Result{}, deleteArgoCDClusterSecret(ctx, mgmtClient, cluster.Name)
+	}
+
 	// create serviceaccount in target cluster
 	svc, err := CreateServiceAccount(ctx, targetClientset, "argocd-manager")
 	if err != nil {

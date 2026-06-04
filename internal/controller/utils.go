@@ -8,6 +8,7 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -176,6 +177,19 @@ func CreateOrUpdateClusterRoleBinding(ctx context.Context, clientset *kubernetes
 
 	// if found, update the cluster role
 	return clientset.RbacV1().ClusterRoleBindings().Update(ctx, desired, v1.UpdateOptions{})
+}
+
+// GetKubeSystemUID returns the UID of the target cluster's kube-system
+// namespace. The kube-system UID is a stable, cluster-unique fingerprint —
+// it's the same signal ArgoCD uses to identify a cluster — so we use it to
+// detect when a CAPI Cluster points at the very cluster the controller (and
+// ArgoCD) run on.
+func GetKubeSystemUID(ctx context.Context, clientset kubernetes.Interface) (types.UID, error) {
+	ns, err := clientset.CoreV1().Namespaces().Get(ctx, "kube-system", v1.GetOptions{})
+	if err != nil {
+		return "", err
+	}
+	return ns.UID, nil
 }
 
 // GetServiceAccountBearerToken returns a bearer token for the service account
